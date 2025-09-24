@@ -8,6 +8,7 @@ import time
 import random
 import secrets
 import os
+import asyncpg
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -72,172 +73,174 @@ DB_LOCK = asyncio.Lock()
 MATCH_LOCK = asyncio.Lock()
 
 
-# --- 🗄️ Database Functions ---
+# --- 🗄️ Database Functions (PostgreSQL Version) ---
+
+# Global variable to hold the database connection pool
+POOL = None
+
 async def initialize_db(application: Application):
-    """Creates all necessary database tables."""
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                gender TEXT,
-                age INTEGER,
-                languages TEXT,
-                interests TEXT,
-                is_premium INTEGER DEFAULT 0,
-                intent TEXT,
-                kinks TEXT,
-                show_active_status INTEGER DEFAULT 1
-            )
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                user_id INTEGER PRIMARY KEY,
-                state TEXT DEFAULT 'idle',
-                partner_id INTEGER,
-                searching_message_id INTEGER,
-                pinned_message_id INTEGER,
-                chat_start_time REAL,
-                last_chat_id INTEGER,
-                search_prefs TEXT,
-                original_search_prefs TEXT
-            )
-            """
-        )
+    """Connects to the PostgreSQL database and creates tables if they don't exist."""
+    global POOL
+    try:
+        DATABASE_URL = os.environ.get("DATABASE_URL")
+        if not DATABASE_URL:
+            logger.error("DATABASE_URL environment variable not set!")
+            return
         
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_history (
-                chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user1_id INTEGER,
-                user2_id INTEGER,
-                start_time REAL,
-                end_time REAL,
-                user1_wants_favorite INTEGER DEFAULT 0,
-                user2_wants_favorite INTEGER DEFAULT 0,
-                user1_vibe_tag TEXT,
-                user2_vibe_tag TEXT
-            )
-            """
-        )
+        POOL = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("Database connection pool created.")
 
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS connections (
-                connection_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user1_id INTEGER,
-                user2_id INTEGER,
-                user1_snapshot TEXT,
-                user2_snapshot TEXT,
-                timestamp REAL,
-                UNIQUE(user1_id, user2_id)
+        async with POOL.acquire() as connection:
+            # PostgreSQL uses SERIAL PRIMARY KEY instead of INTEGER PRIMARY KEY AUTOINCREMENT
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    gender TEXT,
+                    age INTEGER,
+                    languages TEXT,
+                    interests TEXT,
+                    is_premium INTEGER DEFAULT 0,
+                    intent TEXT,
+                    kinks TEXT,
+                    show_active_status INTEGER DEFAULT 1
                 )
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_map (
-                chat_id INTEGER, original_user_id INTEGER, original_msg_id INTEGER,
-                forwarded_user_id INTEGER, forwarded_msg_id INTEGER,
-                PRIMARY KEY (forwarded_user_id, forwarded_msg_id)
-            )
-            """
-        )
+            """)
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    user_id BIGINT PRIMARY KEY,
+                    state TEXT DEFAULT 'idle',
+                    partner_id BIGINT,
+                    searching_message_id BIGINT,
+                    pinned_message_id BIGINT,
+                    chat_start_time REAL,
+                    last_chat_id INTEGER,
+                    search_prefs TEXT,
+                    original_search_prefs TEXT
+                )
+            """)
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    chat_id SERIAL PRIMARY KEY,
+                    user1_id BIGINT,
+                    user2_id BIGINT,
+                    start_time REAL,
+                    end_time REAL,
+                    user1_wants_favorite INTEGER DEFAULT 0,
+                    user2_wants_favorite INTEGER DEFAULT 0,
+                    user1_vibe_tag TEXT,
+                    user2_vibe_tag TEXT
+                )
+            """)
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS connections (
+                    connection_id SERIAL PRIMARY KEY,
+                    user1_id BIGINT,
+                    user2_id BIGINT,
+                    user1_snapshot TEXT,
+                    user2_snapshot TEXT,
+                    timestamp REAL,
+                    UNIQUE(user1_id, user2_id)
+                )
+            """)
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS message_map (
+                    chat_id INTEGER, original_user_id BIGINT, original_msg_id BIGINT,
+                    forwarded_user_id BIGINT, forwarded_msg_id BIGINT,
+                    PRIMARY KEY (forwarded_user_id, forwarded_msg_id)
+                )
+            """)
+            await connection.execute("""
+                CREATE TABLE IF NOT EXISTS invites (
+                    invite_token TEXT PRIMARY KEY,
+                    host_user_id BIGINT NOT NULL,
+                    creation_time REAL NOT NULL
+                )
+            """)
+        logger.info("Database tables initialized.")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
 
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS invites (
-                invite_token TEXT PRIMARY KEY,
-                host_user_id INTEGER NOT NULL,
-                creation_time REAL NOT NULL
-            )
-            """
-        )
-
-        await db.commit()
-    logger.info("Database initialized.")
+async def close_db(application: Application):
+    """Closes the database connection pool."""
+    if POOL:
+        await POOL.close()
+        logger.info("Database connection pool closed.")
 
 async def get_user_data(user_id):
     """Fetches combined profile and session data for a user."""
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM users LEFT JOIN sessions USING(user_id) WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
+    async with POOL.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users LEFT JOIN sessions USING(user_id) WHERE user_id = $1", user_id)
         return dict(row) if row else None
 
 async def update_user_data(user_id, data):
     """Saves or updates a user's profile and/or session data."""
-    # --- MODIFIED: Added intent and kinks ---
-    user_cols = {"name", "gender", "age", "languages", "interests", "is_premium", "intent", "kinks"}
+    user_cols = {"name", "gender", "age", "languages", "interests", "is_premium", "intent", "kinks", "show_active_status"}
     session_cols = {"state", "partner_id", "searching_message_id", "pinned_message_id", "chat_start_time", "last_chat_id", "search_prefs", "original_search_prefs"}
     
     user_data_to_update = {k: v for k, v in data.items() if k in user_cols}
     session_data_to_update = {k: v for k, v in data.items() if k in session_cols}
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id, name) VALUES (?, ?)", (user_id, "Stranger"))
-        await db.execute("INSERT OR IGNORE INTO sessions (user_id) VALUES (?)", (user_id,))
+
+    async with POOL.acquire() as conn:
+        # PostgreSQL uses ON CONFLICT ... DO NOTHING instead of INSERT OR IGNORE
+        await conn.execute("INSERT INTO users (user_id, name) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING", user_id, "Stranger")
+        await conn.execute("INSERT INTO sessions (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+        
         if user_data_to_update:
-            set_clause = ", ".join([f"{key} = ?" for key in user_data_to_update])
-            values = list(user_data_to_update.values()); values.append(user_id)
-            await db.execute(f"UPDATE users SET {set_clause} WHERE user_id = ?", tuple(values))
+            # PostgreSQL uses $1, $2, etc. for placeholders
+            set_clause = ", ".join([f"{key} = ${i+1}" for i, key in enumerate(user_data_to_update)])
+            values = list(user_data_to_update.values())
+            values.append(user_id)
+            await conn.execute(f"UPDATE users SET {set_clause} WHERE user_id = ${len(values)}", *values)
+
         if session_data_to_update:
-            set_clause = ", ".join([f"{key} = ?" for key in session_data_to_update])
-            values = list(session_data_to_update.values()); values.append(user_id)
-            await db.execute(f"UPDATE sessions SET {set_clause} WHERE user_id = ?", tuple(values))
-        await db.commit()
+            set_clause = ", ".join([f"{key} = ${i+1}" for i, key in enumerate(session_data_to_update)])
+            values = list(session_data_to_update.values())
+            values.append(user_id)
+            await conn.execute(f"UPDATE sessions SET {set_clause} WHERE user_id = ${len(values)}", *values)
 
 async def delete_user_profile(user_id):
     """Resets a user's profile but keeps premium status and connections."""
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        # --- MODIFIED: Added intent and kinks to the reset ---
-        await db.execute(
-            "UPDATE users SET name='Anonymous', gender=NULL, age=NULL, languages=NULL, interests=NULL, intent=NULL, kinks=NULL WHERE user_id = ?", 
-            (user_id,)
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET name='Anonymous', gender=NULL, age=NULL, languages=NULL, interests=NULL, intent=NULL, kinks=NULL WHERE user_id = $1", 
+            user_id
         )
-        await db.commit()
     logger.info(f"Reset profile for user {user_id}. Connections and premium status were preserved.")
 
 async def get_waiting_pool():
     """Gets all users currently in the 'waiting' state from the database."""
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM users u JOIN sessions s ON u.user_id = s.user_id WHERE s.state = 'waiting'")
-        rows = await cursor.fetchall()
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM users u JOIN sessions s ON u.user_id = s.user_id WHERE s.state = 'waiting'")
         return [dict(row) for row in rows]
 
 async def map_message(chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id):
     """Stores a robust, two-way mapping between an original message and its forwarded version."""
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            """INSERT OR IGNORE INTO message_map 
-               (chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id) 
-               VALUES (?, ?, ?, ?, ?)""",
-            (chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id)
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO message_map (chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id) 
+               VALUES ($1, $2, $3, $4, $5) ON CONFLICT (forwarded_user_id, forwarded_msg_id) DO NOTHING""",
+            chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id
         )
-        await db.commit()
 
 async def get_mapped_message_id(chat_id, user_id_replying, replied_to_msg_id):
     """Finds the original message ID that a user's reply corresponds to in the partner's chat."""
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute(
-            "SELECT original_msg_id FROM message_map WHERE chat_id = ? AND forwarded_user_id = ? AND forwarded_msg_id = ?",
-            (chat_id, user_id_replying, replied_to_msg_id)
+    async with POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT original_msg_id FROM message_map WHERE chat_id = $1 AND forwarded_user_id = $2 AND forwarded_msg_id = $3",
+            chat_id, user_id_replying, replied_to_msg_id
         )
-        row = await cursor.fetchone()
-        return row[0] if row else None
+        return row['original_msg_id'] if row else None
 
 async def clear_chat_maps(chat_id):
     if not chat_id: return
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM message_map WHERE chat_id = ?", (chat_id,))
-        await db.commit()
+    async with POOL.acquire() as conn:
+        await conn.execute("DELETE FROM message_map WHERE chat_id = $1", chat_id)
 
 async def is_premium(user_id: int) -> bool:
     data = await get_user_data(user_id)
     return data is not None and data.get("is_premium") == 1
+
 
 async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 5):
     """Schedules a job to delete a message after a specified delay in seconds."""
@@ -1536,8 +1539,9 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 🚀 Main Application ---
 def main() -> None:
-    """Starts the bot."""
-    application = Application.builder().token(BOT_TOKEN).post_init(initialize_db).build()
+    """Starts the bot and sets up the database connection."""
+    # --- THIS IS THE CHANGE: Added .post_stop(close_db) ---
+    application = Application.builder().token(BOT_TOKEN).post_init(initialize_db).post_stop(close_db).build()
 
     # A mini-conversation just for changing intent and kinks
     change_intent_handler = ConversationHandler(
@@ -1596,17 +1600,9 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"))
     application.add_handler(CallbackQueryHandler(go_anonymous, pattern="^go_anonymous$"))
 
-    # --- THIS IS THE FIX: CLEAN UP FALLBACK HANDLERS ---
-    # DELETE the old, separate fallback handlers:
-    # application.add_handler(CallbackQueryHandler(fallback_random_callback, pattern="^fallback_random$"))
-    # application.add_handler(CallbackQueryHandler(intent_fallback_callback, pattern="^fallback_intent_"))
-    # application.add_handler(CallbackQueryHandler(fallback_search_callback, pattern=r"^fallback_"))
-    # application.add_handler(CallbackQueryHandler(keep_waiting_callback, pattern="^keep_waiting$"))
-
-    # ADD the single new unified handler:
+    # --- UNIFIED FALLBACK HANDLER ---
     application.add_handler(CallbackQueryHandler(unified_fallback_callback, pattern="^fallback_"))
-    # ---------------------------------------------------
-
+    
     application.add_handler(CallbackQueryHandler(cancel_search, pattern="^cancel_search$"))
     
     # --- FAVORITES & CONNECTIONS HANDLERS ---
@@ -1625,7 +1621,7 @@ def main() -> None:
     
     # --- ADMIN & UTILITY COMMANDS ---
     application.add_handler(CommandHandler("premium", make_premium_command))
-    application.add_handler(CommandHandler("myid", myid_command))
+    application.add_handler(CommandHandler("myid", my_id))
     
     # --- MAIN MESSAGE HANDLER ---
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & filters.ChatType.PRIVATE, message_handler))
