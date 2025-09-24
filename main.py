@@ -1,6 +1,7 @@
-# FireTalk Bot - Final Production Version
+# FireTalk Bot - The Final, Feature-Complete Version
 
 import logging
+import aiosqlite
 import json
 import asyncio
 import time
@@ -21,19 +22,19 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError, BadRequest
 
+
 # --- ⚙️ Configuration & Setup ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
 CHANNEL_USERNAME = "@FireTalkOfficial"
-ADMIN_USER_IDS = [1295160259]
+ADMIN_USER_IDS = [1295160259] # Add your admin User ID(s) here
 
 # Timers
-AD_BREAK_DURATION = 10
-CHAT_LOCK_DURATION = 90
-MATCH_FALLBACK_TIMEOUT = 30
-MIN_CHAT_DURATION_FOR_FAVORITE = 30
+AD_BREAK_DURATION = 10 
+CHAT_LOCK_DURATION = 90 # 3 minutes
+MATCH_FALLBACK_TIMEOUT = 30 # 30 seconds
+MIN_CHAT_DURATION_FOR_FAVORITE = 30 # 1 minute for testing, change to 600 for production
 
-# --- Keyboards ---
+# --- NEW & FINALIZED KEYBOARDS ---
 MAIN_MENU_KEYBOARD_BASIC = InlineKeyboardMarkup([
     [InlineKeyboardButton("🚀 Find a Stranger", callback_data="find_stranger")],
     [InlineKeyboardButton("🤝 Invite a Friend", callback_data="invite_friend")],
@@ -53,55 +54,92 @@ PROFILE_SETTINGS_KEYBOARD = InlineKeyboardMarkup([
 ])
 CHAT_REPLY_KEYBOARD = ReplyKeyboardMarkup([["➡️ Next", "🛑 Stop"]], resize_keyboard=True)
 
-# --- Logging ---
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# --- States & Profile Options ---
-AGREE_TERMS, NAME, GENDER, AGE, LANGUAGES, INTENT, KINKS, PREF_GENDER, PREF_LANGUAGE = range(9)
+# --- NEW & FINALIZED STATES ---
+AGREE_TERMS, NAME, LANGUAGES, GENDER, AGE, INTENT, KINKS, PREF_GENDER, PREF_LANGUAGE = range(9)
+
+# --- NEW & FINALIZED PROFILE OPTIONS ---
 AVAILABLE_LANGUAGES = ["English", "Spanish", "Hindi", "French", "German", "Russian"]
 AVAILABLE_INTENTS = ["💬 Casual Talk", "😏 Flirting", "🔥 Sexting", "🎭 Roleplay", "😈 Truth or Dare", "📸 Pic Trading", "🎬 GIF War", "🤫 Anything Goes"]
 AVAILABLE_KINKS = ["Dominance", "Submission", "Switch", "Gentle", "Rough", "Romantic", "Verbal", "Role Scenarios", "Power Play", "Fantasy", "Slow Burn", "Direct"]
 
-# --- Concurrency Locks ---
+# Concurrency Locks
+DB_LOCK = asyncio.Lock()
 MATCH_LOCK = asyncio.Lock()
-POOL = None # Global variable for the database connection pool
+
 
 # --- 🗄️ Database Functions (PostgreSQL Version) ---
 
+# Global variable to hold the database connection pool
+POOL = None
+
 async def initialize_db(application: Application):
+    """Connects to the PostgreSQL database and creates tables if they don't exist."""
     global POOL
-    if not DATABASE_URL:
-        logger.critical("DATABASE_URL environment variable not set! Bot cannot start.")
-        return
     try:
+        DATABASE_URL = os.environ.get("DATABASE_URL")
+        if not DATABASE_URL:
+            logger.error("DATABASE_URL environment variable not set!")
+            return
+        
         POOL = await asyncpg.create_pool(DATABASE_URL)
+        logger.info("Database connection pool created.")
+
         async with POOL.acquire() as connection:
+            # PostgreSQL uses SERIAL PRIMARY KEY instead of INTEGER PRIMARY KEY AUTOINCREMENT
             await connection.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY, name TEXT NOT NULL, gender TEXT, age INTEGER, languages TEXT,
-                    interests TEXT, is_premium INTEGER DEFAULT 0, intent TEXT, kinks TEXT,
+                    user_id BIGINT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    gender TEXT,
+                    age INTEGER,
+                    languages TEXT,
+                    interests TEXT,
+                    is_premium INTEGER DEFAULT 0,
+                    intent TEXT,
+                    kinks TEXT,
                     show_active_status INTEGER DEFAULT 1
                 )
             """)
             await connection.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
-                    user_id BIGINT PRIMARY KEY, state TEXT DEFAULT 'idle', partner_id BIGINT,
-                    searching_message_id BIGINT, pinned_message_id BIGINT, chat_start_time REAL,
-                    last_chat_id INTEGER, search_prefs TEXT, original_search_prefs TEXT
+                    user_id BIGINT PRIMARY KEY,
+                    state TEXT DEFAULT 'idle',
+                    partner_id BIGINT,
+                    searching_message_id BIGINT,
+                    pinned_message_id BIGINT,
+                    chat_start_time REAL,
+                    last_chat_id INTEGER,
+                    search_prefs TEXT,
+                    original_search_prefs TEXT
                 )
             """)
             await connection.execute("""
                 CREATE TABLE IF NOT EXISTS chat_history (
-                    chat_id SERIAL PRIMARY KEY, user1_id BIGINT, user2_id BIGINT, start_time REAL,
-                    end_time REAL, user1_wants_favorite INTEGER DEFAULT 0, user2_wants_favorite INTEGER DEFAULT 0,
-                    user1_vibe_tag TEXT, user2_vibe_tag TEXT
+                    chat_id SERIAL PRIMARY KEY,
+                    user1_id BIGINT,
+                    user2_id BIGINT,
+                    start_time REAL,
+                    end_time REAL,
+                    user1_wants_favorite INTEGER DEFAULT 0,
+                    user2_wants_favorite INTEGER DEFAULT 0,
+                    user1_vibe_tag TEXT,
+                    user2_vibe_tag TEXT
                 )
             """)
             await connection.execute("""
                 CREATE TABLE IF NOT EXISTS connections (
-                    connection_id SERIAL PRIMARY KEY, user1_id BIGINT, user2_id BIGINT,
-                    user1_snapshot TEXT, user2_snapshot TEXT, timestamp REAL, UNIQUE(user1_id, user2_id)
+                    connection_id SERIAL PRIMARY KEY,
+                    user1_id BIGINT,
+                    user2_id BIGINT,
+                    user1_snapshot TEXT,
+                    user2_snapshot TEXT,
+                    timestamp REAL,
+                    UNIQUE(user1_id, user2_id)
                 )
             """)
             await connection.execute("""
@@ -113,39 +151,47 @@ async def initialize_db(application: Application):
             """)
             await connection.execute("""
                 CREATE TABLE IF NOT EXISTS invites (
-                    invite_token TEXT PRIMARY KEY, host_user_id BIGINT NOT NULL, creation_time REAL NOT NULL
+                    invite_token TEXT PRIMARY KEY,
+                    host_user_id BIGINT NOT NULL,
+                    creation_time REAL NOT NULL
                 )
             """)
-        logger.info("Database connection pool created and tables initialized.")
+        logger.info("Database tables initialized.")
     except Exception as e:
-        logger.critical(f"Database initialization failed: {e}")
-        POOL = None
+        logger.error(f"Database initialization failed: {e}")
 
 async def close_db(application: Application):
+    """Closes the database connection pool."""
     if POOL:
         await POOL.close()
         logger.info("Database connection pool closed.")
 
 async def get_user_data(user_id):
-    if not POOL: return None
+    """Fetches combined profile and session data for a user."""
     async with POOL.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM users LEFT JOIN sessions USING(user_id) WHERE user_id = $1", user_id)
         return dict(row) if row else None
 
 async def update_user_data(user_id, data):
-    if not POOL: return
+    """Saves or updates a user's profile and/or session data."""
     user_cols = {"name", "gender", "age", "languages", "interests", "is_premium", "intent", "kinks", "show_active_status"}
     session_cols = {"state", "partner_id", "searching_message_id", "pinned_message_id", "chat_start_time", "last_chat_id", "search_prefs", "original_search_prefs"}
+    
     user_data_to_update = {k: v for k, v in data.items() if k in user_cols}
     session_data_to_update = {k: v for k, v in data.items() if k in session_cols}
+
     async with POOL.acquire() as conn:
+        # PostgreSQL uses ON CONFLICT ... DO NOTHING instead of INSERT OR IGNORE
         await conn.execute("INSERT INTO users (user_id, name) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING", user_id, "Stranger")
         await conn.execute("INSERT INTO sessions (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING", user_id)
+        
         if user_data_to_update:
+            # PostgreSQL uses $1, $2, etc. for placeholders
             set_clause = ", ".join([f"{key} = ${i+1}" for i, key in enumerate(user_data_to_update)])
             values = list(user_data_to_update.values())
             values.append(user_id)
             await conn.execute(f"UPDATE users SET {set_clause} WHERE user_id = ${len(values)}", *values)
+
         if session_data_to_update:
             set_clause = ", ".join([f"{key} = ${i+1}" for i, key in enumerate(session_data_to_update)])
             values = list(session_data_to_update.values())
@@ -153,30 +199,40 @@ async def update_user_data(user_id, data):
             await conn.execute(f"UPDATE sessions SET {set_clause} WHERE user_id = ${len(values)}", *values)
 
 async def delete_user_profile(user_id):
-    if not POOL: return
+    """Resets a user's profile but keeps premium status and connections."""
     async with POOL.acquire() as conn:
-        await conn.execute("UPDATE users SET name='Anonymous', gender=NULL, age=NULL, languages=NULL, interests=NULL, intent=NULL, kinks=NULL WHERE user_id = $1", user_id)
-    logger.info(f"Reset profile for user {user_id}.")
+        await conn.execute(
+            "UPDATE users SET name='Anonymous', gender=NULL, age=NULL, languages=NULL, interests=NULL, intent=NULL, kinks=NULL WHERE user_id = $1", 
+            user_id
+        )
+    logger.info(f"Reset profile for user {user_id}. Connections and premium status were preserved.")
 
 async def get_waiting_pool():
-    if not POOL: return []
+    """Gets all users currently in the 'waiting' state from the database."""
     async with POOL.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM users u JOIN sessions s ON u.user_id = s.user_id WHERE s.state = 'waiting'")
         return [dict(row) for row in rows]
 
 async def map_message(chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id):
-    if not POOL: return
+    """Stores a robust, two-way mapping between an original message and its forwarded version."""
     async with POOL.acquire() as conn:
-        await conn.execute("""INSERT INTO message_map (chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (forwarded_user_id, forwarded_msg_id) DO NOTHING""", chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id)
+        await conn.execute(
+            """INSERT INTO message_map (chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id) 
+               VALUES ($1, $2, $3, $4, $5) ON CONFLICT (forwarded_user_id, forwarded_msg_id) DO NOTHING""",
+            chat_id, original_user_id, original_msg_id, forwarded_user_id, forwarded_msg_id
+        )
 
 async def get_mapped_message_id(chat_id, user_id_replying, replied_to_msg_id):
-    if not POOL: return None
+    """Finds the original message ID that a user's reply corresponds to in the partner's chat."""
     async with POOL.acquire() as conn:
-        row = await conn.fetchrow("SELECT original_msg_id FROM message_map WHERE chat_id = $1 AND forwarded_user_id = $2 AND forwarded_msg_id = $3", chat_id, user_id_replying, replied_to_msg_id)
+        row = await conn.fetchrow(
+            "SELECT original_msg_id FROM message_map WHERE chat_id = $1 AND forwarded_user_id = $2 AND forwarded_msg_id = $3",
+            chat_id, user_id_replying, replied_to_msg_id
+        )
         return row['original_msg_id'] if row else None
 
 async def clear_chat_maps(chat_id):
-    if not POOL or not chat_id: return
+    if not chat_id: return
     async with POOL.acquire() as conn:
         await conn.execute("DELETE FROM message_map WHERE chat_id = $1", chat_id)
 
@@ -184,15 +240,17 @@ async def is_premium(user_id: int) -> bool:
     data = await get_user_data(user_id)
     return data is not None and data.get("is_premium") == 1
 
+
 async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int = 5):
     """Schedules a job to delete a message after a specified delay in seconds."""
+    
     async def delete_job(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.delete_message(chat_id=ctx.job.chat_id, message_id=ctx.job.data)
         except (TelegramError, BadRequest):
-            pass
-    context.job_queue.run_once(delete_job, delay, data=message_id, chat_id=chat_id)
+            pass # Ignore if message is already gone
 
+    context.job_queue.run_once(delete_job, delay, data=message_id, chat_id=chat_id)
 # --- 👋 Onboarding & Profile Setup ---
 
 async def handle_invite_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -238,9 +296,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user = update.effective_user
     message = update.message or update.callback_query.message
     
+    # --- NEW: Check if the user is joining via an invite link ---
     if await handle_invite_join(update, context):
-        return ConversationHandler.END
+        return ConversationHandler.END # Stop the conversation if it was an invite
 
+    # --- The rest of the function remains the same ---
+    # Check for channel membership first
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user.id)
         if member.status not in ["member", "administrator", "creator"]: raise Exception("User not a member")
@@ -250,12 +311,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await message.reply_text(f"👋 Welcome to FireTalk! 🔥\n\nPlease join our channel and then press /start again.", reply_markup=InlineKeyboardMarkup(keyboard))
         return ConversationHandler.END
 
+    # Check if user already has a full profile
     profile = await get_user_data(user.id)
     if profile and profile.get('name') and profile.get('name') != 'Anonymous':
         keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(user.id) else MAIN_MENU_KEYBOARD_BASIC
         await message.reply_text(f"👋 Welcome back, {profile['name']}! Ready to chat?", reply_markup=keyboard)
         return ConversationHandler.END
 
+    # Start of the onboarding flow with Disclaimer
     context.user_data['profile'] = {}
     disclaimer_text = (
         "⚠️ **Important Rules & Agreement** ⚠️\n\n"
@@ -274,6 +337,7 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     
+    # --- NEW: Add "Skip All" button ---
     keyboard = [
         [InlineKeyboardButton("⚡ Skip All & Chat Now", callback_data="skip_all_setup")],
         [InlineKeyboardButton("⏩ Skip Name", callback_data="skip_name")]
@@ -290,8 +354,11 @@ async def save_default_profile_and_skip(update: Update, context: ContextTypes.DE
     user_id = update.effective_user.id
     
     default_profile = {
-        "name": "Stranger", "gender": None, "age": None,
-        "languages": json.dumps([]), "intent": "🤫 Anything Goes", "kinks": json.dumps([])
+        "name": "Stranger",
+        "gender": None,
+        "age": None,
+        "intent": "🤫 Anything Goes",
+        "kinks": json.dumps([])
     }
     await update_user_data(user_id, default_profile)
     
@@ -300,12 +367,12 @@ async def save_default_profile_and_skip(update: Update, context: ContextTypes.DE
     return ConversationHandler.END
     
 async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['profile'] = {'name': update.message.text}
+    context.user_data['profile']['name'] = update.message.text
     return await ask_gender(update, context)
 
 async def skip_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
-    context.user_data['profile'] = {'name': "Stranger"}
+    context.user_data['profile']['name'] = "Stranger"
     return await ask_gender(update, context, is_callback=True)
 
 async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE, is_callback=False) -> int:
@@ -313,12 +380,11 @@ async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE, is_call
     text = "👍 Next, please select your gender."
     message = update.message or update.callback_query.message
     if is_callback: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    else: await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else: await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard)) # This will happen after name input
     return GENDER
 
 async def ask_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
-    if 'profile' not in context.user_data: context.user_data['profile'] = {}
     if not query.data.startswith("skip"): context.user_data['profile']['gender'] = query.data.split("_")[1]
     text = "🎂 And what is your age?"; keyboard = [[InlineKeyboardButton("⏩ Skip", callback_data="skip_age")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -326,8 +392,6 @@ async def ask_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def ask_languages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     message = update.message or update.callback_query.message
-    if 'profile' not in context.user_data: context.user_data['profile'] = {}
-    
     if update.callback_query and update.callback_query.data == 'skip_age':
         await update.callback_query.answer()
         context.user_data['profile']['age'] = None
@@ -351,42 +415,45 @@ async def handle_language_selection(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query; await query.answer()
     lang = query.data.split("_")[1]
     selected = context.user_data.get('selected_languages', set())
-    if lang in selected: selected.remove(lang)
-    else: selected.add(lang)
+    if lang in selected:
+        selected.remove(lang)
+    else:
+        selected.add(lang)
     context.user_data['selected_languages'] = selected
     keyboard = build_multi_select_keyboard(AVAILABLE_LANGUAGES, selected, "lang")
     await query.edit_message_reply_markup(reply_markup=keyboard)
     return LANGUAGES
 
 async def ask_intent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if 'profile' not in context.user_data: context.user_data['profile'] = {}
-    if update.callback_query:
-        await update.callback_query.answer()
-        if update.callback_query.data.startswith("done_lang"):
-            selected_languages = context.user_data.get('selected_languages', set())
-            context.user_data['profile']['languages'] = json.dumps(list(selected_languages))
+    # --- THIS IS THE FIX: Initialize the profile dictionary ---
+    if 'profile' not in context.user_data:
+        context.user_data['profile'] = {}
     
+    message = update.message or update.callback_query.message
+    if update.callback_query and update.callback_query.data == 'skip_age':
+        await update.callback_query.answer()
+        context.user_data['profile']['age'] = None
+    elif update.message:
+        age = update.message.text
+        if not age.isdigit() or not (13 <= int(age) <= 99):
+            await message.reply_text("Please enter a valid age between 13 and 99."); return AGE
+        context.user_data['profile']['age'] = int(age)
+
     keyboard = [[InlineKeyboardButton(intent, callback_data=f"intent_{intent}")] for intent in AVAILABLE_INTENTS]
     keyboard.append([InlineKeyboardButton("⏩ Skip", callback_data="skip_intent")])
-    text = "🎯 Please select your intent."
+    text = "🎯 Please select your new intent."
 
     if update.callback_query:
-        if update.callback_query.data == 'change_intent_kinks':
-             await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-             if update.callback_query.message.reply_markup:
-                await update.callback_query.edit_message_reply_markup(None)
-        else:
-             await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        # If we are just changing intent, edit the previous menu to show this new question.
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     return INTENT
 
 async def skip_intent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles skipping the intent selection, defaulting to Casual Talk."""
     query = update.callback_query
-    await query.answer()
     context.user_data['profile']['intent'] = "💬 Casual Talk"
-    if 'selected_languages' in context.user_data:
-        context.user_data['profile']['languages'] = json.dumps(list(context.user_data['selected_languages']))
     return await ask_kinks(update, context, is_skip=True)
 
 async def ask_kinks(update: Update, context: ContextTypes.DEFAULT_TYPE, is_skip=False) -> int:
@@ -395,9 +462,6 @@ async def ask_kinks(update: Update, context: ContextTypes.DEFAULT_TYPE, is_skip=
     if not is_skip:
         intent = query.data.split("_", 1)[1]
         context.user_data['profile']['intent'] = intent
-    if 'selected_languages' not in context.user_data:
-        user_profile = await get_user_data(update.effective_user.id)
-        context.user_data['profile']['languages'] = user_profile.get('languages')
 
     context.user_data['selected_kinks'] = set()
     text = "🎭 Finally, select a few tags that match your style (optional, up to 3)."
@@ -415,9 +479,12 @@ async def handle_kink_selection(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query; await query.answer()
     kink = query.data.split("_")[1]
     selected = context.user_data.get('selected_kinks', set())
-    if kink in selected: selected.remove(kink)
-    elif len(selected) < 3: selected.add(kink)
-    else: await query.answer("You can only select up to 3 tags.", show_alert=True)
+    if kink in selected:
+        selected.remove(kink)
+    elif len(selected) < 3:
+        selected.add(kink)
+    else:
+        await query.answer("You can only select up to 3 tags.", show_alert=True)
     context.user_data['selected_kinks'] = selected
     keyboard = build_multi_select_keyboard(AVAILABLE_KINKS, selected, "kink")
     await query.edit_message_reply_markup(reply_markup=keyboard)
@@ -427,29 +494,29 @@ async def profile_complete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query; await query.answer()
     user_id = update.effective_user.id
     
-    # This function is now the exit point for two conversations, so we need to handle both cases
-    if 'selected_kinks' in context.user_data:
-        context.user_data['profile']['kinks'] = json.dumps(list(context.user_data['selected_kinks']))
+    # Save languages
+    selected_languages = context.user_data.get('selected_languages', set())
+    context.user_data['profile']['languages'] = json.dumps(list(selected_languages))
     
-    # Ensure name and gender are preserved when only changing intent/kinks
-    if 'name' not in context.user_data['profile']:
-        user_profile = await get_user_data(user_id)
-        for key in ['name', 'gender', 'age', 'languages']:
-            if key not in context.user_data['profile']:
-                 context.user_data['profile'][key] = user_profile.get(key)
+    # Save kinks
+    selected_kinks = context.user_data.get('selected_kinks', set())
+    context.user_data['profile']['kinks'] = json.dumps(list(selected_kinks))
     
     await update_user_data(user_id, context.user_data['profile'])
     keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(user_id) else MAIN_MENU_KEYBOARD_BASIC
     await query.edit_message_text(text=f"🎉 Your profile is all set!", reply_markup=keyboard)
+
     context.user_data.clear()
     return ConversationHandler.END
 
-# --- Profile Management & Settings Handlers ---
+# --- NEW Profile Management & Settings Handlers ---
 async def my_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays the 'My Profile & Settings' menu with a dynamic active status button."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     
+    # Dynamically create the settings keyboard
     keyboard_buttons = []
     if await is_premium(user_id):
         user_data = await get_user_data(user_id)
@@ -471,6 +538,7 @@ async def my_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def toggle_active_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggles the user's show_active_status setting."""
     query = update.callback_query
     user_id = update.effective_user.id
 
@@ -485,51 +553,43 @@ async def toggle_active_status_callback(update: Update, context: ContextTypes.DE
     await update_user_data(user_id, {"show_active_status": new_status})
     await query.answer(f"Your active status is now set to {'ON' if new_status == 1 else 'OFF'}.")
     
+    # Refresh the menu to show the change instantly
     await my_profile_menu(update, context)
 
 async def go_anonymous(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for the 'Go Anonymous' button."""
     query = update.callback_query
     await query.answer("Resetting to Anonymous...")
     user_id = update.effective_user.id
     default_profile = {
         "name": "Stranger", "gender": None, "age": None,
-        "languages": json.dumps([]), "intent": "🤫 Anything Goes", "kinks": json.dumps([])
+        "intent": "🤫 Anything Goes", "kinks": json.dumps([])
     }
     await update_user_data(user_id, default_profile)
     keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(user_id) else MAIN_MENU_KEYBOARD_BASIC
     await query.edit_message_text("✅ You are now in anonymous mode. Ready to chat!", reply_markup=keyboard)
 
-async def change_intent_kinks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await ask_intent(update, context)
 
-async def reset_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    await delete_user_profile(user_id)
-    context.user_data.clear()
-    return await start_command(update, context)
-
-async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(update.effective_user.id) else MAIN_MENU_KEYBOARD_BASIC
-    await query.edit_message_text(f"👋 Welcome back! Ready to chat?", reply_markup=keyboard)
-
-# --- Invite Friend Handlers ---
 async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generates a unique, one-time-use invite link for the user to share."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
 
+    # Generate a secure, random token for the link
     token = secrets.token_urlsafe(16)
     
+    # --- THIS IS THE CHANGE ---
+    # Store the invite in the PostgreSQL database using the connection pool
     async with POOL.acquire() as conn:
+        # PostgreSQL uses $1, $2, $3 for placeholders instead of ?
         await conn.execute(
             "INSERT INTO invites (invite_token, host_user_id, creation_time) VALUES ($1, $2, $3)",
             token, user_id, time.time()
         )
+    # --------------------------
 
+    # Get the bot's username to build the link
     bot_username = (await context.bot.get_me()).username
     link = f"https://t.me/{bot_username}?start={token}"
     
@@ -545,56 +605,55 @@ async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def cancel_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels a pending invite."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     token = query.data.split("_")[2]
 
+    # --- THIS IS THE CHANGE ---
+    # Connect to the PostgreSQL pool and use the correct placeholder syntax
     async with POOL.acquire() as conn:
         await conn.execute(
             "DELETE FROM invites WHERE invite_token = $1 AND host_user_id = $2", 
             token, user_id
         )
+    # --------------------------
     
     await update_user_data(user_id, {"state": "idle"})
     keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(user_id) else MAIN_MENU_KEYBOARD_BASIC
     await query.edit_message_text("✅ Invite cancelled. You are back to the main menu.", reply_markup=keyboard)
 
+async def change_intent_kinks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the mini-conversation to change only intent and kinks."""
+    await update.callback_query.answer()
+    # This now properly calls the entry point of our mini-conversation
+    return await ask_intent(update, context)
+
+async def reset_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handler for the 'Reset Full Profile' button that correctly starts the setup conversation."""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    # --- THIS IS THE FIX ---
+    # Step 1: Delete the old profile from the database first.
+    await delete_user_profile(user_id)
+    context.user_data.clear()
+    
+    # Step 2: Now that the profile is gone, start the conversation from the beginning.
+    # This calls the start_command, which will now see you as a new user.
+    return await start_command(update, context)
+
+
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Returns the user to the main menu from a sub-menu."""
+    query = update.callback_query
+    await query.answer()
+    keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(update.effective_user.id) else MAIN_MENU_KEYBOARD_BASIC
+    await query.edit_message_text(f"👋 Welcome back! Ready to chat?", reply_markup=keyboard)
 
 # --- 🤝 Matching & Chatting Logic ---
-def check_mutual_match(user1, user2):
-    """
-    Checks for a mutual match, prioritizing Intent, then all premium preferences.
-    """
-    try:
-        intent1 = user1.get("intent")
-        intent2 = user2.get("intent")
-        if intent1 and intent2 and intent1 != "🤫 Anything Goes" and intent2 != "🤫 Anything Goes" and intent1 != intent2:
-            return False
 
-        prefs1 = json.loads(user1.get("search_prefs") or '{}')
-        prefs2 = json.loads(user2.get("search_prefs") or '{}')
-        gender_pref1 = prefs1.get("gender", "Any")
-        lang_pref1 = prefs1.get("language", "Any")
-        gender_pref2 = prefs2.get("gender", "Any")
-        lang_pref2 = prefs2.get("language", "Any")
-
-        languages1 = json.loads(user1.get("languages") or '[]')
-        languages2 = json.loads(user2.get("languages") or '[]')
-        gender1 = user1.get("gender")
-        gender2 = user2.get("gender")
-
-        if gender_pref1 != "Any" and gender_pref1 != gender2: return False
-        if lang_pref1 != "Any" and (not languages2 or lang_pref1 not in languages2): return False
-            
-        if gender_pref2 != "Any" and gender_pref2 != gender1: return False
-        if lang_pref2 != "Any" and (not languages1 or lang_pref2 not in languages1): return False
-            
-        logger.info(f"Mutual match check PASSED for {user1['user_id']} and {user2['user_id']}")
-        return True
-    except Exception as e:
-        logger.error(f"Error during match check: {e}")
-        return False
     
 async def find_stranger_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
@@ -604,8 +663,7 @@ async def find_stranger_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("🎯 Who would you like to talk to?", reply_markup=InlineKeyboardMarkup(keyboard))
         return PREF_GENDER
     else:
-        # For non-premium users, clear any old prefs and go straight to matching
-        await update_user_data(user_id, {"search_prefs": json.dumps({}), "original_search_prefs": json.dumps({})})
+        await query.edit_message_text("⏳ Searching for a partner...")
         await add_to_pool_and_match(context, user_id)
         return ConversationHandler.END
 
@@ -644,9 +702,11 @@ async def add_to_pool_and_match(context: ContextTypes.DEFAULT_TYPE, user_id: int
 
     logger.info(f"User {user_id} has entered the waiting pool.")
 
+    # --- Schedule the single Unified Fallback Timer ---
     prefs = json.loads(user_data.get("search_prefs") or '{}')
     current_intent = user_data.get("intent")
     
+    # Check if ANY specific criteria are set
     has_premium_prefs = await is_premium(user_id) and (prefs.get("gender", "Any") != "Any" or prefs.get("language", "Any") != "Any")
     has_specific_intent = current_intent and current_intent != "🤫 Anything Goes"
 
@@ -670,17 +730,20 @@ async def unified_fallback_check(context: ContextTypes.DEFAULT_TYPE):
     
     keyboard_buttons = []
     
+    # --- Scan for Premium Preference partial matches ---
     if await is_premium(user_id):
         gender_pref = prefs.get("gender", "Any")
         lang_pref = prefs.get("language", "Any")
         
+        # Scan for users who match Gender but not Language
         if gender_pref != "Any":
             for candidate in pool:
                 if candidate['user_id'] != user_id and candidate.get("gender") == gender_pref and candidate.get("intent") in [user_intent, "🤫 Anything Goes"]:
                     btn_text = f"🗣️ Chat with a {gender_pref} (Any Language)"
                     keyboard_buttons.append([InlineKeyboardButton(btn_text, callback_data=f"fallback_pref_{gender_pref}_Any")])
-                    break
+                    break # Found one, no need to look for more
         
+        # Scan for users who match Language but not Gender
         if lang_pref != "Any":
             for candidate in pool:
                 if candidate['user_id'] != user_id and lang_pref in json.loads(candidate.get("languages") or '[]') and candidate.get("intent") in [user_intent, "🤫 Anything Goes"]:
@@ -688,9 +751,11 @@ async def unified_fallback_check(context: ContextTypes.DEFAULT_TYPE):
                     keyboard_buttons.append([InlineKeyboardButton(btn_text, callback_data=f"fallback_pref_Any_{lang_pref}")])
                     break
 
+    # --- Add the Intent fallback option ---
     if user_intent and user_intent != "🤫 Anything Goes":
         keyboard_buttons.append([InlineKeyboardButton("➡️ Switch Your Intent to 'Anything Goes'", callback_data="fallback_intent_switch")])
 
+    # --- Add the generic options ---
     keyboard_buttons.append([InlineKeyboardButton("🎲 Connect with Anyone (Random)", callback_data="fallback_random")])
     keyboard_buttons.append([InlineKeyboardButton("⏳ Keep Waiting for Perfect Match", callback_data="fallback_keep")])
     
@@ -714,6 +779,7 @@ async def unified_fallback_callback(update: Update, context: ContextTypes.DEFAUL
     fallback_type = parts[1]
 
     if fallback_type == "pref":
+        # e.g., "fallback_pref_Male_Any"
         gender, language = parts[2], parts[3]
         prefs = {"gender": gender, "language": language}
         await query.edit_message_text("⏳ Okay, broadening your preferences...")
@@ -721,12 +787,14 @@ async def unified_fallback_callback(update: Update, context: ContextTypes.DEFAUL
         await add_to_pool_and_match(context, user_id)
         
     elif fallback_type == "intent":
+        # e.g., "fallback_intent_switch"
         await query.edit_message_text("✅ Your intent has been updated to 'Anything Goes'. Searching again...")
         await update_user_data(user_id, {"intent": "🤫 Anything Goes"})
         await add_to_pool_and_match(context, user_id)
 
     elif fallback_type == "random":
         await query.edit_message_text("⏳ Okay, searching for any available user...")
+        # Clear all specific criteria for a truly random search
         await update_user_data(user_id, {"search_prefs": json.dumps({}), "intent": "🤫 Anything Goes"})
         await add_to_pool_and_match(context, user_id)
 
@@ -735,27 +803,157 @@ async def unified_fallback_callback(update: Update, context: ContextTypes.DEFAUL
             "⏳ Okay, continuing to search for a perfect match...", 
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Search", callback_data="cancel_search")]])
         )
+        # Reschedule the same unified job to run again
         context.job_queue.run_once(unified_fallback_check, 30, data={'user_id': user_id}, name=f"fallback_{user_id}")
+
+# async def fallback_random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     query = update.callback_query; await query.answer()
+#     user_id = update.effective_user.id
+#     await query.edit_message_text("⏳ Okay, searching for any available user...")
+#     await update_user_data(user_id, {"search_prefs": json.dumps({})})
+#     await add_to_pool_and_match(context, user_id)
+
+
+
+async def match_users(context: ContextTypes.DEFAULT_TYPE, user1_id: int, user2_id: int, is_reconnect: bool = False):
+    """
+    Connects two users, sends a feature-rich pinned message, and correctly handles reconnects AND favorite requests.
+    (PostgreSQL Version)
+    """
+    logger.info(f"✅ MATCH FOUND: Connecting {user1_id} and {user2_id}. Is Reconnect: {is_reconnect}")
+
+    user1_data_live = await get_user_data(user1_id)
+    user2_data_live = await get_user_data(user2_id)
+    
+    # We will acquire one connection to handle multiple database tasks
+    async with POOL.acquire() as conn:
+        # Start a transaction to ensure all database actions succeed or fail together
+        async with conn.transaction():
+            # --- Database and State Updates ---
+            # Use RETURNING chat_id to get the ID of the new row, which is the standard PostgreSQL way
+            record = await conn.fetchrow("INSERT INTO chat_history (user1_id, user2_id, start_time) VALUES ($1, $2, $3) RETURNING chat_id", user1_id, user2_id, time.time())
+            chat_id = record['chat_id']
+            
+            chat_start_time = time.time()
+            # These functions will acquire their own connections from the pool, which is fine
+            await update_user_data(user1_id, {"state": "in_chat", "partner_id": user2_id, "last_chat_id": chat_id, "chat_start_time": chat_start_time, "searching_message_id": None})
+            await update_user_data(user2_id, {"state": "in_chat", "partner_id": user1_id, "last_chat_id": chat_id, "chat_start_time": chat_start_time, "searching_message_id": None})
+            
+            # --- Check for existing connection and load snapshots within the same transaction ---
+            existing_connection = await conn.fetchrow("SELECT connection_id FROM connections WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)", user1_id, user2_id)
+            
+            user1_profile_to_show = user1_data_live
+            user2_profile_to_show = user2_data_live
+            if is_reconnect:
+                logger.info("Reconnect detected. Loading profile snapshots.")
+                conn_rec = await conn.fetchrow("SELECT * FROM connections WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)", user1_id, user2_id)
+                if conn_rec:
+                    user1_profile_to_show = json.loads(conn_rec['user1_snapshot'])
+                    user2_profile_to_show = json.loads(conn_rec['user2_snapshot'])
+
+    # --- Logic that happens after the database transaction is complete ---
+    if not existing_connection:
+        is_user1_premium = user1_data_live.get('is_premium', 0) == 1
+        is_user2_premium = user2_data_live.get('is_premium', 0) == 1
+        if (is_user1_premium or is_user2_premium):
+            context.job_queue.run_once(send_favorite_option_job, MIN_CHAT_DURATION_FOR_FAVORITE, data={"user1_id": user1_id, "user2_id": user2_id, "chat_id": chat_id}, name=f"favorite_{chat_id}")
+
+    for data in [user1_data_live, user2_data_live]:
+        if data and data.get("searching_message_id"):
+            try: await context.bot.delete_message(chat_id=data['user_id'], message_id=data['searching_message_id'])
+            except (TelegramError, BadRequest): pass
+
+    for current_user, partner_profile in [(user1_data_live, user2_profile_to_show), (user2_data_live, user1_profile_to_show)]:
+        current_user_id = current_user['user_id']
+        is_current_premium = current_user.get('is_premium', 0) == 1
+        is_partner_premium = partner_profile.get('is_premium', 0) == 1
+
+        p_kinks = json.loads(partner_profile.get('kinks') or '[]')
+        match_text = (f"✨ **It's a match!** ✨\n\nYour partner's selected tags: {', '.join(p_kinks) if p_kinks else 'None'}")
+        
+        if not is_current_premium and is_partner_premium:
+            match_text += f"\n\n💎 *You're connected with a Premium user! Your chat controls are locked for {int(CHAT_LOCK_DURATION/60)} minutes.*"
+        
+        await context.bot.send_message(current_user_id, text=match_text, reply_markup=CHAT_REPLY_KEYBOARD, parse_mode='Markdown')
+        
+        p_name = partner_profile.get('name', 'Stranger')
+        p_gender = partner_profile.get('gender')
+        p_age = partner_profile.get('age')
+        p_intent = partner_profile.get('intent', 'a chat')
+        gender_char = f"{p_gender[0]}" if p_gender in ["Male", "Female"] else ""
+        age_str = f"{p_age}" if p_age else ""
+        details_str = f", {gender_char}{age_str}" if gender_char or age_str else ""
+        pin_text = f"👤 You are chatting with **{p_name}**{details_str} for **{p_intent}**"
+        
+        name_msg = await context.bot.send_message(current_user_id, pin_text, parse_mode='Markdown')
+        try:
+            await context.bot.pin_chat_message(chat_id=current_user_id, message_id=name_msg.message_id, disable_notification=True)
+            await update_user_data(current_user_id, {"pinned_message_id": name_msg.message_id})
+        except TelegramError as e:
+            logger.error(f"Failed to pin message for {current_user_id}: {e}")
+
+async def send_favorite_option_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    A scheduled job that offers premium users the option to favorite their partner.
+    Now with better logging and a robust check.
+    """
+    job_data = context.job.data
+    user1_id, user2_id = job_data["user1_id"], job_data["user2_id"]
+    last_chat_id = job_data["chat_id"]
+
+    logger.info(f"Running favorite option job for chat_id {last_chat_id} between {user1_id} and {user2_id}")
+
+    # Get current data to ensure they are still in the same chat
+    user1_data = await get_user_data(user1_id)
+    user2_data = await get_user_data(user2_id)
+
+    # This is the critical check that fixes the bug
+    if not (user1_data and user2_data and
+            user1_data.get("state") == "in_chat" and
+            user1_data.get("partner_id") == user2_id and
+            user1_data.get("last_chat_id") == last_chat_id):
+        logger.info(f"Chat {last_chat_id} ended or changed before favorite option could be sent. Aborting job.")
+        return
+
+    logger.info(f"Users are still in chat {last_chat_id}. Proceeding to send favorite buttons.")
+    is_user1_premium = user1_data.get("is_premium") == 1
+    is_user2_premium = user2_data.get("is_premium") == 1
+
+    keyboard = [[
+        InlineKeyboardButton("⭐ Add to Favorites", callback_data=f"favorite_{last_chat_id}"),
+        InlineKeyboardButton("🤔 Ask Later", callback_data=f"favorite_later_{last_chat_id}")
+    ]]
+    message_text = "✨ Enjoying this conversation? You can add this user to your favorites to chat again later!"
+
+    if is_user1_premium:
+        await context.bot.send_message(user1_id, message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    if is_user2_premium and not is_user1_premium: # Only send to user2 if they are premium and user1 is not
+        await context.bot.send_message(user2_id, message_text, reply_markup=InlineKeyboardMarkup(keyboard))
+    # If both are premium, the button will be sent to both from each respective check.
+
 
 async def run_matching_algorithm(context: ContextTypes.DEFAULT_TYPE):
     async with MATCH_LOCK:
         pool = await get_waiting_pool()
-        logger.info(f"Running matching algorithm. Pool size: {len(pool)}.")
+        logger.info(f"Running RANDOM matching. Pool size: {len(pool)}.")
         if len(pool) < 2: return
-        
         users_to_match = list(pool)
         while len(users_to_match) >= 2:
             searcher = users_to_match.pop(0)
             eligible_partners = [p for p in users_to_match if check_mutual_match(searcher, p)]
             if eligible_partners:
                 chosen_partner = random.choice(eligible_partners)
-                logger.info(f"✅ MUTUAL MATCH FOUND: {searcher['user_id']} and {chosen_partner['user_id']}")
+                logger.info(f"✅ MUTUAL MATCH FOUND (Randomly selected): {searcher['user_id']} and {chosen_partner['user_id']}")
                 asyncio.create_task(match_users(context, searcher['user_id'], chosen_partner['user_id']))
                 users_to_match.remove(chosen_partner)
+            else:
+                logger.info(f"User {searcher['user_id']} found no eligible partners in this run.")
 
 async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = update.effective_user.id
+    # --- THIS IS THE FIX: Clear the searching_message_id ---
     await update_user_data(user_id, {"state": "idle", "searching_message_id": None})
     logger.info(f"User {user_id} cancelled search.")
     await query.answer("Search cancelled.")
@@ -766,6 +964,10 @@ async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(user_id, "You are back in the main menu.", reply_markup=keyboard)
 
 async def end_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """
+    Helper function to end a chat session for a user and their partner.
+    NOW triggers the Vibe Check for both users using a robust job. (PostgreSQL Version)
+    """
     user_data = await get_user_data(user_id)
     if not user_data or user_data.get("state") != "in_chat":
         return None, 0, None
@@ -776,13 +978,20 @@ async def end_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     chat_duration = time.time() - chat_start_time
 
     if last_chat_id:
+        # --- THIS IS THE CHANGE ---
         async with POOL.acquire() as conn:
-            await conn.execute("UPDATE chat_history SET end_time = $1 WHERE chat_id = $2", time.time(), last_chat_id)
+            await conn.execute(
+                "UPDATE chat_history SET end_time = $1 WHERE chat_id = $2",
+                time.time(), last_chat_id
+            )
+        # --------------------------
 
     await clear_chat_maps(last_chat_id)
     for uid in [user_id, partner_id]:
         if uid:
             data = await get_user_data(uid)
+            jobs = context.job_queue.get_jobs_by_name(f"unlock_{uid}")
+            for job in jobs: job.schedule_removal()
             if data and data.get("pinned_message_id"):
                 try: await context.bot.unpin_chat_message(chat_id=uid, message_id=data.get("pinned_message_id"))
                 except (TelegramError, BadRequest): pass
@@ -794,47 +1003,76 @@ async def end_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
         ended_msg = await context.bot.send_message(partner_id, "👋 Your partner has ended the chat.", reply_markup=ReplyKeyboardRemove())
         await schedule_message_deletion(context, partner_id, ended_msg.message_id, delay=10)
 
+    # --- TRIGGER VIBE CHECK (Robust Method) ---
     for uid in [user_id, partner_id]:
         if uid and last_chat_id:
-            context.job_queue.run_once(vibe_check_job, 2, data={'user_id': uid, 'chat_id': last_chat_id}, name=f"vibe_check_{uid}_{last_chat_id}")
+            context.job_queue.run_once(
+                vibe_check_job,
+                2, # 2 seconds delay
+                data={'user_id': uid, 'chat_id': last_chat_id},
+                name=f"vibe_check_{uid}_{last_chat_id}"
+            )
 
     return partner_id, chat_duration, last_chat_id
 
 async def vibe_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """A dedicated, reliable job function to send the vibe check."""
     job_data = context.job.data
     await send_vibe_check(context, job_data['user_id'], job_data['chat_id'])
 
 async def send_vibe_check(context: ContextTypes.DEFAULT_TYPE, user_id: int, chat_id: int):
+    """Sends the post-chat Vibe Check prompt."""
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 Intense", callback_data=f"vibe_{chat_id}_Intense"), InlineKeyboardButton("🎭 Creative", callback_data=f"vibe_{chat_id}_Creative")],
-        [InlineKeyboardButton("😴 Slow", callback_data=f"vibe_{chat_id}_Slow"), InlineKeyboardButton("🚫 Report", callback_data=f"vibe_{chat_id}_Report")]
+        [
+            InlineKeyboardButton("🔥 Intense", callback_data=f"vibe_{chat_id}_Intense"),
+            InlineKeyboardButton("🎭 Creative", callback_data=f"vibe_{chat_id}_Creative")
+        ],
+        [
+            InlineKeyboardButton("😴 Slow", callback_data=f"vibe_{chat_id}_Slow"),
+            InlineKeyboardButton("🚫 Report", callback_data=f"vibe_{chat_id}_Report")
+        ]
     ])
     try:
-        await context.bot.send_message(user_id, "How was that last chat? Your anonymous feedback helps improve future matches.", reply_markup=keyboard)
+        await context.bot.send_message(
+            user_id,
+            "How was that last chat? Your anonymous feedback helps improve future matches.",
+            reply_markup=keyboard
+        )
     except (TelegramError, BadRequest):
         logger.warning(f"Could not send vibe check to user {user_id}.")
 
 async def vibe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the Vibe Check button press and saves the feedback."""
     query = update.callback_query
     await query.answer("Thanks for your feedback!")
+
     user_id = update.effective_user.id
     _, chat_id_str, tag = query.data.split("_")
     chat_id = int(chat_id_str)
 
+    # --- THIS IS THE CHANGE ---
     async with POOL.acquire() as conn:
+        # fetchrow returns a dictionary-like object by default
         history = await conn.fetchrow("SELECT user1_id FROM chat_history WHERE chat_id = $1", chat_id)
-        if not history: return
-        column_to_update = "user1_vibe_tag" if history["user1_id"] == user_id else "user2_vibe_tag"
-        await conn.execute(f"UPDATE chat_history SET {column_to_update} = $1 WHERE chat_id = $2", tag, chat_id)
+        if not history:
+            return
 
-    msg = await query.edit_message_text(f"Feedback received: **{tag}**. Thank you!", parse_mode='Markdown')
-    await schedule_message_deletion(context, query.message.chat_id, msg.message_id, delay=5)
+        # Determine if the current user was user1 or user2 in the chat
+        column_to_update = "user1_vibe_tag" if history["user1_id"] == user_id else "user2_vibe_tag"
+        # Use $1, $2 placeholders for the UPDATE query
+        await conn.execute(f"UPDATE chat_history SET {column_to_update} = $1 WHERE chat_id = $2", tag, chat_id)
+    # --------------------------
+
+    await query.edit_message_text(f"Feedback received: **{tag}**. Thank you!", parse_mode='Markdown')
+    await schedule_message_deletion(context, query.message.chat_id, query.message.message_id, delay=5)
 
 async def media_timer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the user's choice for the media timer and forwards the media."""
     query = update.callback_query; await query.answer()
     user_id = update.effective_user.id
     user_data = await get_user_data(user_id)
     
+    # Check if the action is still valid
     if not (user_data and user_data.get("state") == "in_chat" and 'media_to_forward' in context.user_data):
         await query.edit_message_text("This action has expired.")
         return
@@ -845,10 +1083,20 @@ async def media_timer_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     timer_duration = int(query.data.split("_")[2])
 
     await query.edit_message_text(f"Sending with protection..." if timer_duration > 0 else "Sending normally...")
+
     try:
-        sent_message = await context.bot.copy_message(chat_id=partner_id, from_chat_id=user_id, message_id=original_msg_id, protect_content=(timer_duration > 0))
+        # Forward the media to the partner, protecting it from being saved or forwarded if a timer is set
+        sent_message = await context.bot.copy_message(
+            chat_id=partner_id,
+            from_chat_id=user_id,
+            message_id=original_msg_id,
+            protect_content=(timer_duration > 0),
+        )
+        
+        # Create the message maps so replies to the media will work
         await map_message(last_chat_id, user_id, original_msg_id, partner_id, sent_message.message_id)
         await map_message(last_chat_id, partner_id, sent_message.message_id, user_id, original_msg_id)
+
     except (TelegramError, BadRequest) as e:
         logger.error(f"Could not forward media from {user_id} to {partner_id}: {e}")
         await query.edit_message_text("🔴 Could not deliver the media.")
@@ -869,11 +1117,13 @@ async def handle_initiator_action(context: ContextTypes.DEFAULT_TYPE, user_id: i
     if with_ad_break:
         await handle_ad_break(context, user_id, "Please wait")
 
+    # Restore the user's original search preferences for this session
     user_data = await get_user_data(user_id)
     if original_prefs_str := user_data.get("original_search_prefs"):
         await update_user_data(user_id, {"search_prefs": original_prefs_str})
 
     if action == "Next":
+        # Clear any leftover searching_message_id before starting a new search
         await update_user_data(user_id, {"searching_message_id": None})
         await add_to_pool_and_match(context, user_id)
     else: # Stop
@@ -881,23 +1131,28 @@ async def handle_initiator_action(context: ContextTypes.DEFAULT_TYPE, user_id: i
         await context.bot.send_message(user_id, "You are back in the main menu.", reply_markup=keyboard)
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles all messages, including text, media (with premium timer), and chat controls."""
     if not update.message or not update.effective_user: return
     user_id = update.effective_user.id
     user_data = await get_user_data(user_id)
 
+    # --- NEW, ROBUST LOGIC FOR CHAT CONTROLS ---
     if update.message.text and update.message.text in ["➡️ Next", "🛑 Stop"]:
         if user_data.get("state") == "in_chat":
             is_initiator_premium = await is_premium(user_id)
             partner_id, _, _ = await end_chat(context, user_id)
             await context.bot.send_message(user_id, "💬 Chat ended.", reply_markup=ReplyKeyboardRemove())
 
+            # Handle the "victim" (the person who DID NOT click) instantly
             if partner_id:
+                # Clear their old searching_message_id before re-queuing
                 await update_user_data(partner_id, {"searching_message_id": None})
                 partner_data = await get_user_data(partner_id)
                 if partner_prefs_str := partner_data.get("original_search_prefs"):
                     await update_user_data(partner_id, {"search_prefs": partner_prefs_str})
                 await add_to_pool_and_match(context, partner_id)
 
+            # Handle the "initiator" (the person who CLICKED)
             action = "Next" if update.message.text == "➡️ Next" else "Stop"
             context.application.create_task(
                 handle_initiator_action(context, user_id, action, with_ad_break=not is_initiator_premium)
@@ -905,9 +1160,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await update.message.reply_text("You are not currently in a chat. Press /start to begin.")
         return
-        
+
     if user_data.get("state") != "in_chat": return
 
+    # --- Premium Media and Standard Forwarding Logic (No changes here) ---
     is_media = update.message.photo or update.message.video or update.message.voice or update.message.video_note or update.message.document
     if is_media and await is_premium(user_id):
         context.user_data['media_to_forward'] = update.message.message_id
@@ -933,7 +1189,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("🔴 Could not deliver message. Your partner may have disconnected.")
         await end_chat(context, user_id)
 
+
 # --- ⭐ Premium Feature: Favorites & Reconnect ---
+
 async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the 'Add to Favorites' button using the Mutual Match system. (PostgreSQL Version)"""
     query = update.callback_query
@@ -983,6 +1241,8 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
              await query.edit_message_text("✅ Great! If your partner also adds you, you will be connected instantly.")
 
+
+
 async def consent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the non-premium user's response to a favorite request."""
     query = update.callback_query
@@ -1007,6 +1267,8 @@ async def consent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("You have declined the request.")
         await context.bot.send_message(initiator_id, f"😔 Unfortunately, **{accepter_data.get('name', 'your partner')}** declined your request to connect.", parse_mode='Markdown')
 
+
+# --- THIS IS THE NEW, CORRECTED VERSION ---
 async def create_connection(context: ContextTypes.DEFAULT_TYPE, user1_id: int, user2_id: int):
     """Creates a permanent connection, saving a full snapshot of both users' profiles. (PostgreSQL Version)"""
     user1_data = await get_user_data(user1_id)
@@ -1037,6 +1299,7 @@ async def create_connection(context: ContextTypes.DEFAULT_TYPE, user1_id: int, u
     logger.info(f"Created a permanent connection between {user1_id} and {user2_id}")
     await context.bot.send_message(user1_id, f"🎉 You and **{user2_snapshot['name']}** are now favorites!", parse_mode='Markdown')
     await context.bot.send_message(user2_id, f"🎉 You and **{user1_snapshot['name']}** are now favorites!", parse_mode='Markdown')
+
 
 async def my_connections_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Displays a list of the user's saved connections, now with live active status. (PostgreSQL Version)"""
@@ -1084,6 +1347,7 @@ async def my_connections_callback(update: Update, context: ContextTypes.DEFAULT_
     keyboard_buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
     await query.edit_message_text("Here are your favorites. Green (🟢) means they are available to chat right now.", reply_markup=InlineKeyboardMarkup(keyboard_buttons))
 
+
 async def remove_connection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Permanently removes a connection for both users. (PostgreSQL Version)"""
     query = update.callback_query
@@ -1115,6 +1379,7 @@ async def reconnect_request_callback(update: Update, context: ContextTypes.DEFAU
     initiator_data = await get_user_data(initiator_id)
     target_data = await get_user_data(target_id)
     
+    # Priority Interrupt Logic for busy users
     if target_data and target_data.get('state') != 'idle':
         keyboard = [[
             InlineKeyboardButton("✅ Yes, switch chats", callback_data=f"accept_interrupt_{initiator_id}"),
@@ -1126,8 +1391,10 @@ async def reconnect_request_callback(update: Update, context: ContextTypes.DEFAU
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown'
         )
         await context.bot.send_message(initiator_id, "💌 Your connection is currently busy. They have been notified you want to chat.")
+
         return
 
+    # Standard Reconnect Logic for idle users
     keyboard = [[
         InlineKeyboardButton("✅ Accept", callback_data=f"accept_reconnect_{initiator_id}"),
         InlineKeyboardButton("❌ Decline", callback_data=f"decline_reconnect_{initiator_id}")
@@ -1178,6 +1445,8 @@ async def accept_reconnect_callback(update: Update, context: ContextTypes.DEFAUL
     
     await asyncio.sleep(1)
     
+    # --- THIS IS THE KEY CHANGE ---
+    # We now tell match_users that this is a special reconnect chat.
     await match_users(context, initiator_id, accepter_id, is_reconnect=True)
 
 
