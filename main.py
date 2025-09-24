@@ -653,7 +653,43 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(f"👋 Welcome back! Ready to chat?", reply_markup=keyboard)
 
 # --- 🤝 Matching & Chatting Logic ---
+def check_mutual_match(user1, user2):
+    """
+    Checks for a mutual match, prioritizing Intent, then basic preferences.
+    """
+    try:
+        # --- Intent Check (Highest Priority) ---
+        intent1 = user1.get("intent")
+        intent2 = user2.get("intent")
+        
+        # If both users have a specific intent, they MUST match. "Anything Goes" matches with any intent.
+        if intent1 and intent2 and intent1 != "🤫 Anything Goes" and intent2 != "🤫 Anything Goes" and intent1 != intent2:
+            return False
 
+        # --- Basic Preference Check (Premium Feature) ---
+        prefs1 = json.loads(user1.get("search_prefs") or '{}')
+        prefs2 = json.loads(user2.get("search_prefs") or '{}')
+        gender_pref1 = prefs1.get("gender", "Any")
+        lang_pref1 = prefs1.get("language", "Any")
+        gender_pref2 = prefs2.get("gender", "Any")
+        
+        gender1 = user1.get("gender")
+        gender2 = user2.get("gender")
+        
+        # Check if user1's preferences match user2's profile
+        if gender_pref1 != "Any" and gender_pref1 != gender2: return False
+        
+        # Check if user2's preferences match user1's profile
+        if gender_pref2 != "Any" and gender_pref2 != gender1: return False
+        
+        # Note: Language check is now less critical but can be added back if needed.
+        # Focusing on Intent and Gender preference is the highest priority.
+
+        logger.info(f"Mutual match check PASSED for {user1['user_id']} and {user2['user_id']}")
+        return True
+    except Exception as e:
+        logger.error(f"Error during match check: {e}")
+        return False
     
 async def find_stranger_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query; await query.answer()
