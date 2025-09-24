@@ -26,7 +26,6 @@ from telegram.error import TelegramError, BadRequest
 # --- ⚙️ Configuration & Setup ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_USERNAME = "@FireTalkOfficial"
-DB_FILE = "/var/data/firetalk_bot.db"
 ADMIN_USER_IDS = [1295160259] # Add your admin User ID(s) here
 
 # Timers
@@ -257,50 +256,40 @@ async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id:
 async def handle_invite_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Checks if a user is joining via a valid invite link and connects them."""
     if not context.args:
-        return False # Not an invite link
+        return False
 
     token = context.args[0]
     guest_user_id = update.effective_user.id
     
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM invites WHERE invite_token = ?", (token,))
-        invite = await cursor.fetchone()
+    async with POOL.acquire() as conn:
+        invite = await conn.fetchrow("SELECT * FROM invites WHERE invite_token = $1", token)
+        if not invite:
+            await update.message.reply_text("This invite link is invalid or has already been used.")
+            return True
 
-    if not invite:
-        await update.message.reply_text("This invite link is invalid or has already been used.")
-        return True # Invite was handled (even if failed)
+        if time.time() - invite['creation_time'] > 300:
+            await update.message.reply_text("This invite link has expired.")
+            await conn.execute("DELETE FROM invites WHERE invite_token = $1", token)
+            return True
+        
+        host_user_id = invite['host_user_id']
+        if host_user_id == guest_user_id:
+            await update.message.reply_text("You cannot use your own invite link.")
+            return True
 
-    # Check if the invite has expired (e.g., 5 minutes = 300 seconds)
-    if time.time() - invite['creation_time'] > 300:
-        await update.message.reply_text("This invite link has expired.")
-        async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-            await db.execute("DELETE FROM invites WHERE invite_token = ?", (token,))
-            await db.commit()
-        return True
+        host_data = await get_user_data(host_user_id)
+        if not host_data or host_data.get("state") != "hosting":
+            await update.message.reply_text("The user who invited you is no longer waiting. The invite has been cancelled.")
+            await conn.execute("DELETE FROM invites WHERE invite_token = $1", token)
+            return True
         
-    host_user_id = invite['host_user_id']
-    if host_user_id == guest_user_id:
-        await update.message.reply_text("You cannot use your own invite link.")
-        return True
-
-    host_data = await get_user_data(host_user_id)
-    if not host_data or host_data.get("state") != "hosting":
-        await update.message.reply_text("The user who invited you is no longer waiting. The invite has been cancelled.")
-        return True
+        await context.bot.send_message(host_user_id, "✅ Your friend has joined! Connecting you now...")
+        await update.message.reply_text("✅ Invite accepted! Connecting you now...")
         
-    # Success! Connect the users.
-    await context.bot.send_message(host_user_id, "✅ Your friend has joined! Connecting you now...")
-    await update.message.reply_text("✅ Invite accepted! Connecting you now...")
-    
-    # Clean up the invite token
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM invites WHERE invite_token = ?", (token,))
-        await db.commit()
+        await conn.execute("DELETE FROM invites WHERE invite_token = $1", token)
         
-    # Match them!
-    await match_users(context, host_user_id, guest_user_id)
-    return True
+        await match_users(context, host_user_id, guest_user_id)
+        return True
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles new users, returning users, and users joining from an invite link."""
@@ -590,13 +579,15 @@ async def create_invite_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Generate a secure, random token for the link
     token = secrets.token_urlsafe(16)
     
-    # Store the invite in the database
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT INTO invites (invite_token, host_user_id, creation_time) VALUES (?, ?, ?)",
-            (token, user_id, time.time())
+    # --- THIS IS THE CHANGE ---
+    # Store the invite in the PostgreSQL database using the connection pool
+    async with POOL.acquire() as conn:
+        # PostgreSQL uses $1, $2, $3 for placeholders instead of ?
+        await conn.execute(
+            "INSERT INTO invites (invite_token, host_user_id, creation_time) VALUES ($1, $2, $3)",
+            token, user_id, time.time()
         )
-        await db.commit()
+    # --------------------------
 
     # Get the bot's username to build the link
     bot_username = (await context.bot.get_me()).username
@@ -620,9 +611,14 @@ async def cancel_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     token = query.data.split("_")[2]
 
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM invites WHERE invite_token = ? AND host_user_id = ?", (token, user_id))
-        await db.commit()
+    # --- THIS IS THE CHANGE ---
+    # Connect to the PostgreSQL pool and use the correct placeholder syntax
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM invites WHERE invite_token = $1 AND host_user_id = $2", 
+            token, user_id
+        )
+    # --------------------------
     
     await update_user_data(user_id, {"state": "idle"})
     keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(user_id) else MAIN_MENU_KEYBOARD_BASIC
@@ -659,36 +655,34 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # --- 🤝 Matching & Chatting Logic ---
 def check_mutual_match(user1, user2):
     """
-    Checks for a mutual match, prioritizing Intent, then basic preferences.
+    Checks for a mutual match, prioritizing Intent, then all premium preferences.
     """
     try:
-        # --- Intent Check (Highest Priority) ---
         intent1 = user1.get("intent")
         intent2 = user2.get("intent")
-        
-        # If both users have a specific intent, they MUST match. "Anything Goes" matches with any intent.
         if intent1 and intent2 and intent1 != "🤫 Anything Goes" and intent2 != "🤫 Anything Goes" and intent1 != intent2:
             return False
 
-        # --- Basic Preference Check (Premium Feature) ---
         prefs1 = json.loads(user1.get("search_prefs") or '{}')
         prefs2 = json.loads(user2.get("search_prefs") or '{}')
         gender_pref1 = prefs1.get("gender", "Any")
         lang_pref1 = prefs1.get("language", "Any")
         gender_pref2 = prefs2.get("gender", "Any")
-        
+        lang_pref2 = prefs2.get("language", "Any")
+
+        languages1 = json.loads(user1.get("languages") or '[]')
+        languages2 = json.loads(user2.get("languages") or '[]')
         gender1 = user1.get("gender")
         gender2 = user2.get("gender")
-        
-        # Check if user1's preferences match user2's profile
-        if gender_pref1 != "Any" and gender_pref1 != gender2: return False
-        
-        # Check if user2's preferences match user1's profile
-        if gender_pref2 != "Any" and gender_pref2 != gender1: return False
-        
-        # Note: Language check is now less critical but can be added back if needed.
-        # Focusing on Intent and Gender preference is the highest priority.
 
+        # Check user1's prefs against user2's profile
+        if gender_pref1 != "Any" and gender_pref1 != gender2: return False
+        if lang_pref1 != "Any" and (not languages2 or lang_pref1 not in languages2): return False
+            
+        # Check user2's prefs against user1's profile
+        if gender_pref2 != "Any" and gender_pref2 != gender1: return False
+        if lang_pref2 != "Any" and (not languages1 or lang_pref2 not in languages1): return False
+            
         logger.info(f"Mutual match check PASSED for {user1['user_id']} and {user2['user_id']}")
         return True
     except Exception as e:
@@ -846,59 +840,58 @@ async def unified_fallback_callback(update: Update, context: ContextTypes.DEFAUL
         # Reschedule the same unified job to run again
         context.job_queue.run_once(unified_fallback_check, 30, data={'user_id': user_id}, name=f"fallback_{user_id}")
 
-async def fallback_random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    user_id = update.effective_user.id
-    await query.edit_message_text("⏳ Okay, searching for any available user...")
-    await update_user_data(user_id, {"search_prefs": json.dumps({})})
-    await add_to_pool_and_match(context, user_id)
+# async def fallback_random_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     query = update.callback_query; await query.answer()
+#     user_id = update.effective_user.id
+#     await query.edit_message_text("⏳ Okay, searching for any available user...")
+#     await update_user_data(user_id, {"search_prefs": json.dumps({})})
+#     await add_to_pool_and_match(context, user_id)
 
 
 
 async def match_users(context: ContextTypes.DEFAULT_TYPE, user1_id: int, user2_id: int, is_reconnect: bool = False):
     """
     Connects two users, sends a feature-rich pinned message, and correctly handles reconnects AND favorite requests.
+    (PostgreSQL Version)
     """
     logger.info(f"✅ MATCH FOUND: Connecting {user1_id} and {user2_id}. Is Reconnect: {is_reconnect}")
 
-    # --- Database and State Updates ---
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("INSERT INTO chat_history (user1_id, user2_id, start_time) VALUES (?, ?, ?)", (user1_id, user2_id, time.time()))
-        chat_id = cursor.lastrowid
-        await db.commit()
     user1_data_live = await get_user_data(user1_id)
     user2_data_live = await get_user_data(user2_id)
-    chat_start_time = time.time()
-    await update_user_data(user1_id, {"state": "in_chat", "partner_id": user2_id, "last_chat_id": chat_id, "chat_start_time": chat_start_time, "searching_message_id": None})
-    await update_user_data(user2_id, {"state": "in_chat", "partner_id": user1_id, "last_chat_id": chat_id, "chat_start_time": chat_start_time, "searching_message_id": None})
     
-    # --- THIS IS THE MISSING BLOCK ---
-    # It checks if users are already connected and schedules the favorite job if they are not.
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute("SELECT connection_id FROM connections WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",(user1_id, user2_id, user2_id, user1_id))
-        existing_connection = await cursor.fetchone()
-    
+    # We will acquire one connection to handle multiple database tasks
+    async with POOL.acquire() as conn:
+        # Start a transaction to ensure all database actions succeed or fail together
+        async with conn.transaction():
+            # --- Database and State Updates ---
+            # Use RETURNING chat_id to get the ID of the new row, which is the standard PostgreSQL way
+            record = await conn.fetchrow("INSERT INTO chat_history (user1_id, user2_id, start_time) VALUES ($1, $2, $3) RETURNING chat_id", user1_id, user2_id, time.time())
+            chat_id = record['chat_id']
+            
+            chat_start_time = time.time()
+            # These functions will acquire their own connections from the pool, which is fine
+            await update_user_data(user1_id, {"state": "in_chat", "partner_id": user2_id, "last_chat_id": chat_id, "chat_start_time": chat_start_time, "searching_message_id": None})
+            await update_user_data(user2_id, {"state": "in_chat", "partner_id": user1_id, "last_chat_id": chat_id, "chat_start_time": chat_start_time, "searching_message_id": None})
+            
+            # --- Check for existing connection and load snapshots within the same transaction ---
+            existing_connection = await conn.fetchrow("SELECT connection_id FROM connections WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)", user1_id, user2_id)
+            
+            user1_profile_to_show = user1_data_live
+            user2_profile_to_show = user2_data_live
+            if is_reconnect:
+                logger.info("Reconnect detected. Loading profile snapshots.")
+                conn_rec = await conn.fetchrow("SELECT * FROM connections WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)", user1_id, user2_id)
+                if conn_rec:
+                    user1_profile_to_show = json.loads(conn_rec['user1_snapshot'])
+                    user2_profile_to_show = json.loads(conn_rec['user2_snapshot'])
+
+    # --- Logic that happens after the database transaction is complete ---
     if not existing_connection:
         is_user1_premium = user1_data_live.get('is_premium', 0) == 1
         is_user2_premium = user2_data_live.get('is_premium', 0) == 1
         if (is_user1_premium or is_user2_premium):
             context.job_queue.run_once(send_favorite_option_job, MIN_CHAT_DURATION_FOR_FAVORITE, data={"user1_id": user1_id, "user2_id": user2_id, "chat_id": chat_id}, name=f"favorite_{chat_id}")
-    # --- END OF MISSING BLOCK ---
 
-    # --- Load Snapshot Profiles for Reconnects ---
-    user1_profile_to_show = user1_data_live
-    user2_profile_to_show = user2_data_live
-    if is_reconnect:
-        logger.info("Reconnect detected. Loading profile snapshots.")
-        async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM connections WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",(user1_id, user2_id, user2_id, user1_id))
-            conn = await cursor.fetchone()
-            if conn:
-                user1_profile_to_show = json.loads(conn['user1_snapshot'])
-                user2_profile_to_show = json.loads(conn['user2_snapshot'])
-
-    # --- Announcements, pinning, etc. ---
     for data in [user1_data_live, user2_data_live]:
         if data and data.get("searching_message_id"):
             try: await context.bot.delete_message(chat_id=data['user_id'], message_id=data['searching_message_id'])
@@ -907,7 +900,6 @@ async def match_users(context: ContextTypes.DEFAULT_TYPE, user1_id: int, user2_i
     for current_user, partner_profile in [(user1_data_live, user2_profile_to_show), (user2_data_live, user1_profile_to_show)]:
         current_user_id = current_user['user_id']
         is_current_premium = current_user.get('is_premium', 0) == 1
-        # Check if partner_profile is a dict (snapshot) or a row object (live data)
         is_partner_premium = partner_profile.get('is_premium', 0) == 1
 
         p_kinks = json.loads(partner_profile.get('kinks') or '[]')
@@ -1008,7 +1000,7 @@ async def cancel_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def end_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     """
     Helper function to end a chat session for a user and their partner.
-    NOW triggers the Vibe Check for both users using a robust job.
+    NOW triggers the Vibe Check for both users using a robust job. (PostgreSQL Version)
     """
     user_data = await get_user_data(user_id)
     if not user_data or user_data.get("state") != "in_chat":
@@ -1020,9 +1012,13 @@ async def end_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     chat_duration = time.time() - chat_start_time
 
     if last_chat_id:
-        async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-            await db.execute("UPDATE chat_history SET end_time = ? WHERE chat_id = ?", (time.time(), last_chat_id))
-            await db.commit()
+        # --- THIS IS THE CHANGE ---
+        async with POOL.acquire() as conn:
+            await conn.execute(
+                "UPDATE chat_history SET end_time = $1 WHERE chat_id = $2",
+                time.time(), last_chat_id
+            )
+        # --------------------------
 
     await clear_chat_maps(last_chat_id)
     for uid in [user_id, partner_id]:
@@ -1039,13 +1035,13 @@ async def end_chat(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     if partner_id:
         await update_user_data(partner_id, reset_data)
         ended_msg = await context.bot.send_message(partner_id, "👋 Your partner has ended the chat.", reply_markup=ReplyKeyboardRemove())
-        await schedule_message_deletion(context, partner_id, ended_msg.message_id, delay=10) # Longer delay here
+        await schedule_message_deletion(context, partner_id, ended_msg.message_id, delay=10)
 
     # --- TRIGGER VIBE CHECK (Robust Method) ---
     for uid in [user_id, partner_id]:
         if uid and last_chat_id:
             context.job_queue.run_once(
-                vibe_check_job, 
+                vibe_check_job,
                 2, # 2 seconds delay
                 data={'user_id': uid, 'chat_id': last_chat_id},
                 name=f"vibe_check_{uid}_{last_chat_id}"
@@ -1088,17 +1084,18 @@ async def vibe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, chat_id_str, tag = query.data.split("_")
     chat_id = int(chat_id_str)
 
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT user1_id FROM chat_history WHERE chat_id = ?", (chat_id,))
-        history = await cursor.fetchone()
+    # --- THIS IS THE CHANGE ---
+    async with POOL.acquire() as conn:
+        # fetchrow returns a dictionary-like object by default
+        history = await conn.fetchrow("SELECT user1_id FROM chat_history WHERE chat_id = $1", chat_id)
         if not history:
             return
 
         # Determine if the current user was user1 or user2 in the chat
         column_to_update = "user1_vibe_tag" if history["user1_id"] == user_id else "user2_vibe_tag"
-        await db.execute(f"UPDATE chat_history SET {column_to_update} = ? WHERE chat_id = ?", (tag, chat_id))
-        await db.commit()
+        # Use $1, $2 placeholders for the UPDATE query
+        await conn.execute(f"UPDATE chat_history SET {column_to_update} = $1 WHERE chat_id = $2", tag, chat_id)
+    # --------------------------
 
     await query.edit_message_text(f"Feedback received: **{tag}**. Thank you!", parse_mode='Markdown')
     await schedule_message_deletion(context, query.message.chat_id, query.message.message_id, delay=5)
@@ -1230,7 +1227,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # --- ⭐ Premium Feature: Favorites & Reconnect ---
 
 async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the 'Add to Favorites' button using the Mutual Match system."""
+    """Handles the 'Add to Favorites' button using the Mutual Match system. (PostgreSQL Version)"""
     query = update.callback_query
     initiator_id = update.effective_user.id
     await query.answer()
@@ -1241,41 +1238,31 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❗️ An error occurred with this favorite request.")
         return
 
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM chat_history WHERE chat_id = ?", (chat_id,))
-        history = await cursor.fetchone()
+    async with POOL.acquire() as conn:
+        async with conn.transaction():
+            history = await conn.fetchrow("SELECT * FROM chat_history WHERE chat_id = $1", chat_id)
+            if not history:
+                await query.edit_message_text("❗️ This chat session has expired."); return
 
-    if not history:
-        await query.edit_message_text("❗️ This chat session has expired."); return
+            user_column_to_update = "user1_wants_favorite" if history['user1_id'] == initiator_id else "user2_wants_favorite"
+            updated_history = await conn.fetchrow(
+                f"UPDATE chat_history SET {user_column_to_update} = 1 WHERE chat_id = $1 RETURNING *",
+                chat_id
+            )
 
-    # Determine which user (1 or 2) the initiator is
-    user_column_to_update = "user1_wants_favorite" if history['user1_id'] == initiator_id else "user2_wants_favorite"
-    partner_column_to_check = "user2_wants_favorite" if history['user1_id'] == initiator_id else "user1_wants_favorite"
-    partner_id = history['user2_id'] if history['user1_id'] == initiator_id else history['user1_id']
-
-    # Update the database to show this user wants to connect
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute(f"UPDATE chat_history SET {user_column_to_update} = 1 WHERE chat_id = ?", (chat_id,))
-        await db.commit()
-    
-    # Now, check if the partner ALSO wants to connect
-    partner_wants_to_connect = history[partner_column_to_check] == 1
-
-    if partner_wants_to_connect:
-        # Mutual Match!
-        await query.edit_message_text("🎉 It's a mutual match! Connecting you now...")
+    if updated_history and updated_history['user1_wants_favorite'] == 1 and updated_history['user2_wants_favorite'] == 1:
+        partner_id = updated_history['user2_id'] if updated_history['user1_id'] == initiator_id else updated_history['user1_id']
+        await query.edit_message_text("🎉 It's a mutual match! You are now favorites.")
         await create_connection(context, initiator_id, partner_id)
     else:
-        # Interest is one-sided so far
+        partner_id = history['user2_id'] if history['user1_id'] == initiator_id else history['user1_id']
         is_initiator_premium = await is_premium(initiator_id)
         is_partner_premium = await is_premium(partner_id)
 
-        # If partner is not premium, they won't get a button, so we send a consent request.
         if is_initiator_premium and not is_partner_premium:
              initiator_data = await get_user_data(initiator_id)
              keyboard = [
-                 [InlineKeyboardButton("✅ Yes, connect with them", callback_data=f"consent_yes_{chat_id}_{initiator_id}")],
+                 [InlineKeyboardButton("✅ Yes, connect", callback_data=f"consent_yes_{chat_id}_{initiator_id}")],
                  [InlineKeyboardButton("❌ No, thanks", callback_data=f"consent_no_{chat_id}_{initiator_id}")]
              ]
              await context.bot.send_message(
@@ -1284,10 +1271,9 @@ async def favorite_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  reply_markup=InlineKeyboardMarkup(keyboard),
                  parse_mode='Markdown'
              )
-             await query.edit_message_text("✅ Request sent! If they accept, you'll both be notified.")
+             await query.edit_message_text("✅ Request sent! If they accept, you'll be connected.")
         else:
-             # Both are premium, or initiator is non-premium (should not happen, but safe)
-             await query.edit_message_text("✅ Great! If your partner also adds you as a favorite, we'll connect you both.")
+             await query.edit_message_text("✅ Great! If your partner also adds you, you will be connected instantly.")
 
 
 
@@ -1318,48 +1304,48 @@ async def consent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- THIS IS THE NEW, CORRECTED VERSION ---
 async def create_connection(context: ContextTypes.DEFAULT_TYPE, user1_id: int, user2_id: int):
-    """Creates a permanent connection, saving a full snapshot of both users' profiles."""
+    """Creates a permanent connection, saving a full snapshot of both users' profiles. (PostgreSQL Version)"""
     user1_data = await get_user_data(user1_id)
     user2_data = await get_user_data(user2_id)
     if not user1_data or not user2_data: return
 
-    # Create the snapshot dictionaries
     user1_snapshot = {
         "name": user1_data.get('name', 'Stranger'), "gender": user1_data.get('gender'),
         "age": user1_data.get('age'), "languages": user1_data.get('languages'),
-        "interests": user1_data.get('interests')
+        "intent": user1_data.get('intent'), "kinks": user1_data.get('kinks')
     }
     user2_snapshot = {
         "name": user2_data.get('name', 'Stranger'), "gender": user2_data.get('gender'),
         "age": user2_data.get('age'), "languages": user2_data.get('languages'),
-        "interests": user2_data.get('interests')
+        "intent": user2_data.get('intent'), "kinks": user2_data.get('kinks')
     }
 
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
+    async with POOL.acquire() as conn:
+        await conn.execute(
             """
-            INSERT OR IGNORE INTO connections (user1_id, user2_id, user1_snapshot, user2_snapshot, timestamp)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO connections (user1_id, user2_id, user1_snapshot, user2_snapshot, timestamp)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user1_id, user2_id) DO NOTHING
             """,
-            (user1_id, user2_id, json.dumps(user1_snapshot), json.dumps(user2_snapshot), time.time())
+            user1_id, user2_id, json.dumps(user1_snapshot), json.dumps(user2_snapshot), time.time()
         )
-        await db.commit()
     
     logger.info(f"Created a permanent connection between {user1_id} and {user2_id}")
-    await context.bot.send_message(user1_id, f"🎉 You and **{user2_snapshot['name']}** are now connected!", parse_mode='Markdown')
-    await context.bot.send_message(user2_id, f"🎉 You and **{user1_snapshot['name']}** are now connected!", parse_mode='Markdown')
+    await context.bot.send_message(user1_id, f"🎉 You and **{user2_snapshot['name']}** are now favorites!", parse_mode='Markdown')
+    await context.bot.send_message(user2_id, f"🎉 You and **{user1_snapshot['name']}** are now favorites!", parse_mode='Markdown')
 
 
 async def my_connections_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays a list of the user's saved connections, now with live active status."""
+    """Displays a list of the user's saved connections, now with live active status. (PostgreSQL Version)"""
     query = update.callback_query
     user_id = update.effective_user.id
     await query.answer()
 
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM connections WHERE user1_id = ? OR user2_id = ?", (user_id, user_id))
-        connections = await cursor.fetchall()
+    async with POOL.acquire() as conn:
+        connections = await conn.fetch(
+            "SELECT * FROM connections WHERE user1_id = $1 OR user2_id = $1",
+            user_id
+        )
     
     keyboard = MAIN_MENU_KEYBOARD_PREMIUM if await is_premium(user_id) else MAIN_MENU_KEYBOARD_BASIC
     if not connections:
@@ -1367,25 +1353,23 @@ async def my_connections_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     keyboard_buttons = []
-    for conn in connections:
-        # Determine who the other user is and get their snapshot profile
-        if conn['user1_id'] == user_id:
-            other_user_id = conn['user2_id']
-            other_user_snapshot = json.loads(conn['user2_snapshot'])
+    for conn_rec in connections:
+        if conn_rec['user1_id'] == user_id:
+            other_user_id = conn_rec['user2_id']
+            other_user_snapshot = json.loads(conn_rec['user2_snapshot'])
         else:
-            other_user_id = conn['user1_id']
-            other_user_snapshot = json.loads(conn['user1_snapshot'])
+            other_user_id = conn_rec['user1_id']
+            other_user_snapshot = json.loads(conn_rec['user1_snapshot'])
         
         other_user_name = other_user_snapshot.get('name', 'Stranger')
         
-        # --- NEW: Check Live Status of the other user ---
-        status_icon = "⚪️" # Default to offline/invisible
+        status_icon = "⚪️"
         live_data = await get_user_data(other_user_id)
         if live_data:
             is_visible = live_data.get("show_active_status", 1) == 1
             is_available = live_data.get("state") == "idle"
             if is_visible and is_available:
-                status_icon = "🟢" # User is online and visible
+                status_icon = "🟢"
         
         display_name = f"{status_icon} {other_user_name}"
         
@@ -1399,23 +1383,22 @@ async def my_connections_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def remove_connection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Permanently removes a connection for both users."""
+    """Permanently removes a connection for both users. (PostgreSQL Version)"""
     query = update.callback_query
     user_id = update.effective_user.id
-    await query.answer("Connection removed.", show_alert=True)
+    await query.answer("Favorite removed.", show_alert=True)
 
     try:
         target_id = int(query.data.split("_")[1])
     except (IndexError, ValueError): return
 
-    async with DB_LOCK, aiosqlite.connect(DB_FILE) as db:
-        await db.execute("DELETE FROM connections WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)",
-                         (user_id, target_id, target_id, user_id))
-        await db.commit()
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM connections WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $3 AND user2_id = $4)",
+            user_id, target_id, target_id, user_id
+        )
     
-    # After removing, refresh the connections list to show the updated view
     await my_connections_callback(update, context)
-
 
 async def reconnect_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a reconnect request, including the Priority Interrupt logic."""
@@ -1621,7 +1604,7 @@ def main() -> None:
     
     # --- ADMIN & UTILITY COMMANDS ---
     application.add_handler(CommandHandler("premium", make_premium_command))
-    application.add_handler(CommandHandler("myid", my_id))
+    application.add_handler(CommandHandler("myid", myid_command))
     
     # --- MAIN MESSAGE HANDLER ---
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND & filters.ChatType.PRIVATE, message_handler))
